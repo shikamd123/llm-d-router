@@ -19,9 +19,14 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +55,16 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		return
 	}
 	uuidStr := uuid.String()
+	// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing;
+	// uuidStr (unprefixed) is kept for logging.
+	transferID := "tx" + uuidStr
+
+	// Parallel-dispatch path synthesises decode's kv_transfer_params from config
+	// instead of the prefill response. The serial path below is unchanged when off.
+	if s.config.MoRIIOParallelDispatch && s.config.MoRIIOWriteMode {
+		s.runNIXLProtocolV2WriteParallel(w, r, original, completionRequest, uuidStr, transferID, prefillPodHostPort)
+		return
+	}
 
 	// Prefill Stage
 	tracer := tracing.Tracer()
@@ -69,6 +84,12 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	preq := r.Clone(ctx)
 
 	preq.Header.Add(requestHeaderRequestID, uuidStr)
+
+	// Pin both legs to the same DP rank; the header is skipped for single-DP.
+	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
+	if s.config.MoRIIODPSize > 1 {
+		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
+	}
 
 	// Save original values based on API type
 	streamValue, streamOk := completionRequest[requestFieldStream]
@@ -93,13 +114,31 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// fallback-to-decode path can dispatch with the correct original fields.
 	originalRequest := maps.Clone(completionRequest)
 
-	completionRequest[requestFieldKVTransferParams] = map[string]any{
-		requestFieldDoRemoteDecode:  true,
-		requestFieldDoRemotePrefill: false,
-		requestFieldRemoteEngineID:  nil,
-		requestFieldRemoteBlockIDs:  nil,
-		requestFieldRemoteHost:      nil,
-		requestFieldRemotePort:      nil,
+	// WRITE mode populates the destination fields the prefill engine needs for
+	// its RDMA Write; READ mode leaves them nil per the standard NIXLv2 contract.
+	if s.config.MoRIIOWriteMode {
+		completionRequest[requestFieldKVTransferParams] = map[string]any{
+			requestFieldDoRemoteDecode:       true,
+			requestFieldDoRemotePrefill:      false,
+			requestFieldRemoteEngineID:       nil,
+			requestFieldRemoteBlockIDs:       nil,
+			requestFieldRemoteHost:           s.config.MoRIIODecodePodIP,
+			requestFieldRemotePort:           nil,
+			requestFieldRemoteNotifyPort:     s.config.MoRIIODecodeNotifyPort,
+			requestFieldRemoteDPRank:         dpRank,
+			requestFieldRemoteDPRankOverride: true,
+			requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
+			requestFieldTransferID:           transferID,
+		}
+	} else {
+		completionRequest[requestFieldKVTransferParams] = map[string]any{
+			requestFieldDoRemoteDecode:  true,
+			requestFieldDoRemotePrefill: false,
+			requestFieldRemoteEngineID:  nil,
+			requestFieldRemoteBlockIDs:  nil,
+			requestFieldRemoteHost:      nil,
+			requestFieldRemotePort:      nil,
+		}
 	}
 
 	completionRequest[requestFieldStream] = false
@@ -206,6 +245,14 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	dreq.Header.Add(requestHeaderRequestID, uuidStr)
 
+	// Stamp the same DP-rank pin on the decode leg.
+	if s.config.MoRIIODPSize > 1 {
+		dreq.Header.Set(
+			requestHeaderDataParallelRank,
+			strconv.Itoa(pickDPRank(uuidStr, s.config.MoRIIODPSize)),
+		)
+	}
+
 	delete(completionRequest, requestFieldStream)
 	streamingEnabled := false
 	if streamOk {
@@ -226,7 +273,26 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 			completionRequest[sv.field] = sv.val
 		}
 	}
-
+	// WRITE mode: backfill the decode-side kv_transfer_params fields that
+	// vLLM's request_finished response does not echo back, sourcing the
+	// pod-local values from sidecar config.
+	if s.config.MoRIIOWriteMode {
+		if dKVParams, ok := pKVTransferParams.(map[string]any); ok {
+			if _, present := dKVParams[requestFieldTransferID]; !present {
+				dKVParams[requestFieldTransferID] = transferID
+			}
+			if _, present := dKVParams[requestFieldRemoteNotifyPort]; !present {
+				dKVParams[requestFieldRemoteNotifyPort] = s.config.MoRIIODecodeNotifyPort
+			}
+			if _, present := dKVParams[requestFieldRemoteDPRank]; !present {
+				dKVParams[requestFieldRemoteDPRank] = pickDPRank(uuidStr, s.config.MoRIIODPSize)
+				dKVParams[requestFieldRemoteDPRankOverride] = true
+			}
+			if _, present := dKVParams[requestFieldRemoteHandshakePort]; !present {
+				dKVParams[requestFieldRemoteHandshakePort] = s.config.MoRIIODecodeHandshakePort
+			}
+		}
+	}
 	completionRequest[requestFieldKVTransferParams] = pKVTransferParams
 
 	dbody, err := json.Marshal(completionRequest)
@@ -284,4 +350,233 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 			attribute.Float64("llm_d.pd_proxy.coordinator_overhead_ms", float64(coordinatorOverhead.Milliseconds())),
 		)
 	}
+}
+
+// runNIXLProtocolV2WriteParallel is the MoRI-IO WRITE-mode concurrent-dispatch
+// path: it builds both the prefill and decode bodies up front (synthesising
+// decode's kv_transfer_params from config and prefillPodHostPort) and fires the
+// two upstream calls in parallel so decode's block allocation overlaps prefill.
+func (s *Server) runNIXLProtocolV2WriteParallel(
+	w http.ResponseWriter, r *http.Request, original []byte,
+	completionRequest map[string]any, uuidStr, transferID, prefillPodHostPort string,
+) {
+	s.logger.V(4).Info("running NIXL protocol V2 (concurrent dispatch)",
+		"url", prefillPodHostPort, "request_id", uuidStr)
+
+	tracer := tracing.Tracer()
+	parentCtx := r.Context()
+	requestStartedAt := time.Now()
+
+	// Snapshot client fields before mutating completionRequest into the prefill
+	// body; they are restored when building the decode body.
+	streamValue, streamOk := completionRequest[requestFieldStream]
+	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
+	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
+	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
+
+	// Pin both legs to the same DP rank (kv_transfer_params + HTTP header).
+	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
+
+	// Build prefill body. remote_host points at the decode pod so prefill can
+	// RDMA-Write KV there; remote_dp_size gates the decode-side per-DP-rank
+	// handshake loop for Wide-EP.
+	completionRequest[requestFieldKVTransferParams] = map[string]any{
+		requestFieldDoRemoteDecode:       true,
+		requestFieldDoRemotePrefill:      false,
+		requestFieldRemoteEngineID:       nil,
+		requestFieldRemoteBlockIDs:       nil,
+		requestFieldRemoteHost:           s.config.MoRIIODecodePodIP,
+		requestFieldRemotePort:           nil,
+		requestFieldRemoteNotifyPort:     s.config.MoRIIODecodeNotifyPort,
+		requestFieldRemoteDPRank:         dpRank,
+		requestFieldRemoteDPRankOverride: true,
+		requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
+		requestFieldTransferID:           transferID,
+		"tp_size":                        s.config.MoRIIOTPSize,
+		"remote_dp_size":                 s.config.MoRIIODPSize,
+	}
+	completionRequest[requestFieldStream] = false
+	delete(completionRequest, requestFieldStreamOptions)
+	completionRequest[requestFieldMaxTokens] = 1
+	completionRequest[requestFieldMaxCompletionTokens] = 1
+
+	pbody, err := json.Marshal(completionRequest)
+	if err != nil {
+		if err := errorJSONInvalid(err, w); err != nil {
+			s.logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal P)")
+		}
+		return
+	}
+
+	// ---------- Build decode body ----------
+	// Restore the client's streaming flags and max-token caps.
+	delete(completionRequest, requestFieldStream)
+	if streamOk {
+		completionRequest[requestFieldStream] = streamValue
+	}
+	if streamOptionsOk {
+		completionRequest[requestFieldStreamOptions] = streamOptionsValue
+	}
+	delete(completionRequest, requestFieldMaxTokens)
+	if maxTokensOk {
+		completionRequest[requestFieldMaxTokens] = maxTokensValue
+	}
+	delete(completionRequest, requestFieldMaxCompletionTokens)
+	if maxCompletionTokensOk {
+		completionRequest[requestFieldMaxCompletionTokens] = maxCompletionTokensValue
+	}
+
+	// Synthesise decode-leg kv_transfer_params that the serial path would
+	// otherwise read from the prefill response. do_remote_prefill must be true:
+	// it gates the decode-side send_notify_block that prefill's RDMA Write waits on.
+	prefillHost, _, splitErr := net.SplitHostPort(prefillPodHostPort)
+	if splitErr != nil {
+		prefillHost = prefillPodHostPort
+	}
+
+	completionRequest[requestFieldKVTransferParams] = map[string]any{
+		requestFieldDoRemotePrefill: true,
+		requestFieldDoRemoteDecode:  false,
+		requestFieldRemoteEngineID:  fmt.Sprintf("%s:%d", prefillHost, s.config.MoRIIOPrefillHandshakePort),
+		// Empty (not nil) since decode allocates its own blocks in WRITE mode.
+		requestFieldRemoteBlockIDs:       []any{},
+		requestFieldRemoteHost:           prefillHost,
+		requestFieldRemotePort:           s.config.MoRIIOPrefillHandshakePort,
+		requestFieldRemoteNotifyPort:     s.config.MoRIIOPrefillNotifyPort,
+		requestFieldRemoteDPRank:         dpRank,
+		requestFieldRemoteDPRankOverride: true,
+		requestFieldRemoteHandshakePort:  s.config.MoRIIOPrefillHandshakePort,
+		requestFieldTransferID:           transferID,
+		"tp_size":                        s.config.MoRIIOTPSize,
+		"remote_dp_size":                 s.config.MoRIIODPSize,
+	}
+
+	dbody, err := json.Marshal(completionRequest)
+	if err != nil {
+		if err := errorJSONInvalid(err, w); err != nil {
+			s.logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal D)")
+		}
+		return
+	}
+
+	// ---------- Fire prefill + decode in parallel ----------
+	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
+	if err != nil {
+		if err := errorBadGateway(err, w); err != nil {
+			s.logger.Error(err, "failed to send error response to client (concurrent-dispatch P handler init)")
+		}
+		return
+	}
+
+	// Build cloned requests under separate contexts so each carries its own
+	// span lineage and either side can be observed/cancelled independently
+	// without affecting the other.
+	pCtx, prefillSpan := tracer.Start(parentCtx, "llm_d.pd_proxy.prefill",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	prefillSpan.SetAttributes(
+		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
+		attribute.String("llm_d.pd_proxy.prefill_target", prefillPodHostPort),
+		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
+		attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+	)
+	preq := r.Clone(pCtx)
+	preq.Header.Set(requestHeaderRequestID, uuidStr)
+	if s.config.MoRIIODPSize > 1 {
+		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
+	}
+	preq.Body = io.NopCloser(strings.NewReader(string(pbody)))
+	preq.ContentLength = int64(len(pbody))
+
+	dCtx, decodeSpan := tracer.Start(parentCtx, "llm_d.pd_proxy.decode",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer decodeSpan.End()
+	decodeSpan.SetAttributes(
+		attribute.String("llm_d.pd_proxy.request_id", uuidStr),
+		attribute.String("llm_d.pd_proxy.connector", "nixlv2"),
+		attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+	)
+	dreq := r.Clone(dCtx)
+	dreq.Header.Set(requestHeaderRequestID, uuidStr)
+	if s.config.MoRIIODPSize > 1 {
+		dreq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
+	}
+	dreq.Body = io.NopCloser(strings.NewReader(string(dbody)))
+	dreq.ContentLength = int64(len(dbody))
+
+	s.logger.V(5).Info("concurrent-dispatch prefill request body", "body", string(pbody))
+	s.logger.V(5).Info("concurrent-dispatch decode request body", "body", string(dbody))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Prefill goroutine: response body is discarded; we only observe the
+	// status code for telemetry / fallback decisions.
+	var prefillStatus int
+	var prefillBody string
+	prefillStartedAt := time.Now()
+	go func() {
+		defer wg.Done()
+		defer prefillSpan.End()
+		pw := &bufferedResponseWriter{}
+		prefillHandler.ServeHTTP(pw, preq)
+		prefillStatus = pw.statusCode
+		prefillBody = pw.buffer.String()
+		prefillSpan.SetAttributes(
+			attribute.Int("llm_d.pd_proxy.prefill.status_code", pw.statusCode),
+			attribute.Float64("llm_d.pd_proxy.prefill.duration_ms", float64(time.Since(prefillStartedAt).Milliseconds())),
+		)
+		if isHTTPError(pw.statusCode) {
+			prefillSpan.SetStatus(codes.Error, "prefill request failed")
+			s.logger.Error(nil, "concurrent-dispatch prefill returned error status",
+				"status", pw.statusCode, "request_id", uuidStr, "body", pw.buffer.String())
+		}
+	}()
+
+	// Decode goroutine: streams directly to the client's ResponseWriter.
+	// dataParallelHandler may steal the request and dispatch to another
+	// data-parallel replica; preserve that semantics.
+	decodeStartedAt := time.Now()
+	go func() {
+		defer wg.Done()
+		dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(w, dreq)
+		decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
+		if !dataParallelUsed {
+			decodeSpan.SetAttributes(attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host))
+			s.decoderProxy.ServeHTTP(w, dreq)
+		}
+		decodeSpan.SetAttributes(attribute.Float64("llm_d.pd_proxy.decode.duration_ms", float64(time.Since(decodeStartedAt).Milliseconds())))
+	}()
+
+	wg.Wait()
+
+	// A failed prefill usually also hangs decode; log it so the cause is visible.
+	if isHTTPError(prefillStatus) {
+		s.logger.Info("concurrent-dispatch: prefill failed -- decode may have streamed an error or hung",
+			"request_id", uuidStr, "p_status", prefillStatus, "p_body_snippet", truncate(prefillBody, 256))
+	}
+
+	if currentSpan := trace.SpanFromContext(parentCtx); currentSpan.SpanContext().IsValid() {
+		var totalDuration time.Duration
+		if requestStartValue := parentCtx.Value(requestStartTimeKey); requestStartValue != nil {
+			if requestStart, ok := requestStartValue.(time.Time); ok {
+				totalDuration = time.Since(requestStart)
+			}
+		}
+		currentSpan.SetAttributes(
+			attribute.Float64("llm_d.pd_proxy.total_duration_ms", float64(totalDuration.Milliseconds())),
+			attribute.Float64("llm_d.pd_proxy.parallel_window_ms", float64(time.Since(requestStartedAt).Milliseconds())),
+			attribute.Bool("llm_d.pd_proxy.parallel_dispatch", true),
+		)
+	}
+	_ = original // kept for signature symmetry with the strictly-serial path
+}
+
+// truncate shortens s to at most n characters, appending "..." if truncated.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
