@@ -70,7 +70,8 @@ func (cc *ChatCompletionHandler) GetCompletionRequests() []map[string]any {
 	return append([]map[string]any(nil), cc.CompletionRequests...)
 }
 
-// GetCompletionHeaders returns a snapshot of the received request headers
+// GetCompletionHeaders returns a snapshot of the received request headers,
+// appended in lockstep with GetCompletionRequests, safe for concurrent access.
 func (cc *ChatCompletionHandler) GetCompletionHeaders() []http.Header {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()

@@ -22,10 +22,8 @@ import (
 	"testing"
 )
 
-// TestPickDPRankSingleDP verifies that dpSize <= 1 short-circuits to 0,
-// matching the pre-patch behaviour for non-DP deployments. We must not
-// hash and reduce mod 1 (which would also yield 0 but at the cost of a
-// useless allocation on every request).
+// TestPickDPRankSingleDP verifies dpSize <= 1 short-circuits to 0 without
+// hashing.
 func TestPickDPRankSingleDP(t *testing.T) {
 	for _, dpSize := range []int{0, 1, -1} {
 		if got := pickDPRank("any-request-id", dpSize); got != 0 {
