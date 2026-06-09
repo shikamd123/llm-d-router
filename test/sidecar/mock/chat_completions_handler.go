@@ -54,7 +54,11 @@ type ChatCompletionHandler struct {
 	RequestCount        atomic.Int32
 	CompletionRequests  []map[string]any
 	CompletionResponses []map[string]any
-	mu                  sync.Mutex
+	// CompletionHeaders records the HTTP headers of each received request,
+	// appended in lockstep with CompletionRequests. Used by MoRI-IO tests to
+	// assert the sidecar's X-Data-Parallel-Rank pin on both legs.
+	CompletionHeaders []http.Header
+	mu                sync.Mutex
 }
 
 // GetCompletionRequests returns a snapshot of the received requests, safe for concurrent access.
@@ -62,6 +66,14 @@ func (cc *ChatCompletionHandler) GetCompletionRequests() []map[string]any {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return append([]map[string]any(nil), cc.CompletionRequests...)
+}
+
+// GetCompletionHeaders returns a snapshot of the received request headers,
+// appended in lockstep with GetCompletionRequests, safe for concurrent access.
+func (cc *ChatCompletionHandler) GetCompletionHeaders() []http.Header {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return append([]http.Header(nil), cc.CompletionHeaders...)
 }
 
 func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +96,7 @@ func (cc *ChatCompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 	cc.mu.Lock()
 	cc.CompletionRequests = append(cc.CompletionRequests, completionRequest)
+	cc.CompletionHeaders = append(cc.CompletionHeaders, r.Header.Clone())
 	cc.mu.Unlock()
 
 	var rawResponse string
