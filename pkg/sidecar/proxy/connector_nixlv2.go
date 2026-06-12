@@ -146,6 +146,21 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 			requestFieldRemoteDPRankOverride: true,
 			requestFieldRemoteHandshakePort:  s.config.MoRIIODecodeHandshakePort,
 			requestFieldTransferID:           transferID,
+			"tp_size":                        s.config.MoRIIOTPSize,
+			"remote_dp_size":                 s.config.MoRIIODPSize,
+		}
+		// Wide-EP fan-out (prefill leg, serial path): remote_hosts must be the
+		// DECODE-side pod IPs so prefill handshakes the right pods.
+		if len(s.config.MoRIIODecodeHosts) > 0 {
+			pkv := completionRequest[requestFieldKVTransferParams].(map[string]any)
+			hosts := make([]any, len(s.config.MoRIIODecodeHosts))
+			for i, h := range s.config.MoRIIODecodeHosts {
+				hosts[i] = h
+			}
+			pkv["remote_hosts"] = hosts
+			if s.config.MoRIIODPSizeLocal > 0 {
+				pkv["remote_dp_size_local"] = s.config.MoRIIODPSizeLocal
+			}
 		}
 	} else {
 		completionRequest[requestFieldKVTransferParams] = map[string]any{
@@ -342,6 +357,26 @@ retryLoop:
 			if _, present := dKVParams[requestFieldRemoteHandshakePort]; !present {
 				dKVParams[requestFieldRemoteHandshakePort] = s.config.MoRIIODecodeHandshakePort
 			}
+			// Wide-EP fields for decode-side handshake loop
+			if _, present := dKVParams["remote_dp_size"]; !present {
+				dKVParams["remote_dp_size"] = s.config.MoRIIODPSize
+			}
+			// Wide-EP fan-out (decode leg, serial path): remote_hosts must be the
+			// PREFILL-side pod IPs so decode fans out handshakes across prefill pods.
+			if len(s.config.MoRIIORemoteHosts) > 0 {
+				if _, present := dKVParams["remote_hosts"]; !present {
+					hosts := make([]any, len(s.config.MoRIIORemoteHosts))
+					for i, h := range s.config.MoRIIORemoteHosts {
+						hosts[i] = h
+					}
+					dKVParams["remote_hosts"] = hosts
+				}
+				if s.config.MoRIIODPSizeLocal > 0 {
+					if _, present := dKVParams["remote_dp_size_local"]; !present {
+						dKVParams["remote_dp_size_local"] = s.config.MoRIIODPSizeLocal
+					}
+				}
+			}
 		}
 	}
 	completionRequest[requestFieldKVTransferParams] = pKVTransferParams
@@ -424,6 +459,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
 	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
 	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
+	maxOutputTokensValue, maxOutputTokensOk := completionRequest[requestFieldMaxOutputTokens]
 
 	// Pin both legs to the same DP rank (kv_transfer_params + HTTP header).
 	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
@@ -464,6 +500,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	delete(completionRequest, requestFieldStreamOptions)
 	completionRequest[requestFieldMaxTokens] = 1
 	completionRequest[requestFieldMaxCompletionTokens] = 1
+	completionRequest[requestFieldMaxOutputTokens] = 1
 
 	pbody, err := json.Marshal(completionRequest)
 	if err != nil {
@@ -489,6 +526,10 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	delete(completionRequest, requestFieldMaxCompletionTokens)
 	if maxCompletionTokensOk {
 		completionRequest[requestFieldMaxCompletionTokens] = maxCompletionTokensValue
+	}
+	delete(completionRequest, requestFieldMaxOutputTokens)
+	if maxOutputTokensOk {
+		completionRequest[requestFieldMaxOutputTokens] = maxOutputTokensValue
 	}
 
 	// Synthesise decode-leg kv_transfer_params that the serial path would
