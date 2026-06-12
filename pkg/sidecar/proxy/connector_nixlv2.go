@@ -25,7 +25,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -57,7 +56,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	tokenLimitFields := tokenLimitFieldsForAPIType(apiType)
 	s.logger.V(4).Info("running NIXL protocol V2", "url", prefillPodHostPort, "tokenLimitFields", tokenLimitFields)
 
-	_, completionRequest, ok := s.readJSONBody(r, w)
+	original, completionRequest, ok := s.readJSONBody(r, w)
 	if !ok {
 		return
 	}
@@ -564,7 +563,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	if s.config.MoRIIODPSize > 1 {
 		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
 	}
-	preq.Body = io.NopCloser(strings.NewReader(string(pbody)))
+	preq.Body = io.NopCloser(bytes.NewReader(pbody))
 	preq.ContentLength = int64(len(pbody))
 
 	dCtx, decodeSpan := tracer.Start(parentCtx, "llm_d.pd_proxy.decode",
@@ -581,7 +580,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	if s.config.MoRIIODPSize > 1 {
 		dreq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(dpRank))
 	}
-	dreq.Body = io.NopCloser(strings.NewReader(string(dbody)))
+	dreq.Body = io.NopCloser(bytes.NewReader(dbody))
 	dreq.ContentLength = int64(len(dbody))
 
 	s.logger.V(5).Info("concurrent-dispatch prefill request body", "body", string(pbody))
