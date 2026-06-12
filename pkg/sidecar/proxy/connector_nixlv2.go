@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"net"
 	"net/http"
 	"strconv"
@@ -70,13 +69,12 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		return
 	}
 	uuidStr := uuid.String()
-	// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing;
-	// uuidStr (unprefixed) is kept for logging.
-	transferID := "tx" + uuidStr
 
 	// Parallel-dispatch path synthesises decode's kv_transfer_params from config
 	// instead of the prefill response. The serial path below is unchanged when off.
 	if s.config.MoRIIOParallelDispatch && s.config.MoRIIOWriteMode {
+		// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing.
+		transferID := "tx" + uuidStr
 		s.runNIXLProtocolV2WriteParallel(w, r, original, completionRequest, uuidStr, transferID, prefillPodHostPort)
 		return
 	}
@@ -126,14 +124,11 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		}
 	}
 
-	// Snapshot the original request map before prefill mutations so the
-	// fallback-to-decode path can dispatch with the correct original fields.
-	originalRequest := maps.Clone(completionRequest)
-	_ = originalRequest // used in fallback path
-
 	// WRITE mode populates the destination fields the prefill engine needs for
 	// its RDMA Write; READ mode leaves them nil per the standard NIXLv2 contract.
 	if s.config.MoRIIOWriteMode {
+		// MoRI-IO requires transfer_id to carry the "tx" prefix for message routing.
+		transferID := "tx" + uuidStr
 		completionRequest[requestFieldKVTransferParams] = map[string]any{
 			requestFieldDoRemoteDecode:       true,
 			requestFieldDoRemotePrefill:      false,
@@ -345,7 +340,8 @@ retryLoop:
 	if s.config.MoRIIOWriteMode {
 		if dKVParams, ok := pKVTransferParams.(map[string]any); ok {
 			if _, present := dKVParams[requestFieldTransferID]; !present {
-				dKVParams[requestFieldTransferID] = transferID
+				// MoRI-IO requires transfer_id to carry the "tx" prefix.
+				dKVParams[requestFieldTransferID] = "tx" + uuidStr
 			}
 			if _, present := dKVParams[requestFieldRemoteNotifyPort]; !present {
 				dKVParams[requestFieldRemoteNotifyPort] = s.config.MoRIIODecodeNotifyPort

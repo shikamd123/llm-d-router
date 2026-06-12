@@ -396,14 +396,16 @@ func (opts *Options) Complete() error {
 		return fmt.Errorf("failed to parse target URL: %w", err)
 	}
 
-	// MoRI-IO feature gate: when MoRIIOFeatureEnabled is false, reject any
-	// attempt to use MoRI-IO flags. This keeps the feature dormant until full
-	// CI and production validation is complete.
-	if !MoRIIOFeatureEnabled && opts.MoRIIOWriteMode {
+	// MoRI-IO feature gate: when MoRIIOFeatureEnabled is false, reject ANY
+	// --moriio-* flag at a non-default value. This keeps the feature fully
+	// dormant until CI and production validation is complete. Even flags like
+	// --moriio-dp-size > 1 can affect routing behavior (X-Data-Parallel-Rank
+	// header) without WRITE mode, so all MoRI-IO flags must be blocked.
+	if !MoRIIOFeatureEnabled && opts.hasMoRIIOFlagsSet() {
 		return errors.New(
 			"MoRI-IO WRITE-mode and Wide-EP features are not yet enabled in this release. " +
 				"The --moriio-* flags are reserved for a future release candidate. " +
-				"Please remove --moriio-write-mode and related flags, or wait for the " +
+				"Please remove all --moriio-* flags, or wait for the " +
 				"official feature release. See pkg/sidecar/proxy/MORIIO_README.md for details")
 	}
 
@@ -434,6 +436,28 @@ func (opts *Options) Complete() error {
 	}
 
 	return nil
+}
+
+// hasMoRIIOFlagsSet returns true if any --moriio-* flag is set to a non-default
+// value. Used by the dormant feature gate to reject any MoRI-IO configuration
+// when the feature is not yet enabled.
+func (opts *Options) hasMoRIIOFlagsSet() bool {
+	// Behavioral flags that affect routing or wire shape
+	if opts.MoRIIOWriteMode || opts.MoRIIOParallelDispatch {
+		return true
+	}
+	// DP-size > 1 triggers X-Data-Parallel-Rank header even without WRITE mode
+	if opts.MoRIIODPSize > 1 {
+		return true
+	}
+	// Wide-EP multi-pod configuration
+	if len(opts.MoRIIORemoteHosts) > 0 || len(opts.MoRIIODecodeHosts) > 0 {
+		return true
+	}
+	if opts.MoRIIODPSizeLocal > 0 {
+		return true
+	}
+	return false
 }
 
 // validateWideEPHosts checks the multi-pod fan-out invariants for one host

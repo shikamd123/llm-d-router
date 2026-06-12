@@ -878,13 +878,36 @@ func TestCompleteWideEPValidation(t *testing.T) {
 // preconditions added by the WRITE-mode sidecar commit: WRITE mode needs a
 // routable decode pod IP, and concurrent dispatch is WRITE-mode-only.
 func TestCompleteMoRIIOWriteModeGuards(t *testing.T) {
-	// When MoRIIOFeatureEnabled is false (dormant), all MoRI-IO flags should
+	// When MoRIIOFeatureEnabled is false (dormant), ALL MoRI-IO flags should
 	// be rejected with the dormant feature message.
 	if !MoRIIOFeatureEnabled {
 		t.Run("dormant feature rejects write-mode", func(t *testing.T) {
 			opts := NewOptions()
 			opts.MoRIIOWriteMode = true
 			opts.MoRIIODecodePodIP = "10.0.1.1"
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects dp-size > 1", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIODPSize = 8 // non-default, affects routing
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects remote-hosts", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIORemoteHosts = []string{"10.0.0.1", "10.0.0.2"}
+			opts.MoRIIODPSize = 16
+			opts.MoRIIODPSizeLocal = 8
+			err := opts.Complete()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "not yet enabled")
+		})
+		t.Run("dormant feature rejects dp-size-local > 0", func(t *testing.T) {
+			opts := NewOptions()
+			opts.MoRIIODPSizeLocal = 8
 			err := opts.Complete()
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "not yet enabled")
